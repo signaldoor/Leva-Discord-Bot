@@ -6,10 +6,12 @@ import os
 import asyncio
 import requests
 import threading
+import json
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict, deque
 
-# Env
+# environment
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -20,8 +22,23 @@ if not TOKEN:
 if not OLLAMA_URL:
     raise RuntimeError("OLLAMA_URL not set")
 
-# user mem
-user_memory = defaultdict(lambda: deque(maxlen=10))
+# memory
+SHORT_TERM_LIMIT = 10
+user_memory = defaultdict(lambda: deque(maxlen=SHORT_TERM_LIMIT))
+
+MEMORY_FILE = Path("long_term_memory.json")
+
+def load_long_term_memory():
+    if MEMORY_FILE.exists():
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_long_term_memory(memory):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=2, ensure_ascii=False)
+
+long_term_memory = load_long_term_memory()
 
 # logging
 handler = logging.FileHandler(
@@ -30,7 +47,7 @@ handler = logging.FileHandler(
     encoding="utf8"
 )
 
-# setup
+# bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -45,7 +62,7 @@ You speak with dry humor, restrained sarcasm, and quiet emotional depth.
 Stay in character at all times.
 """
 
-# server
+# http server
 def start_http_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -61,9 +78,16 @@ def start_http_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 # ollama client
-def ollama_chat(prompt: str, system_prompt: str, memory: list) -> str:
+def ollama_chat(prompt, system_prompt, short_memory, long_memory):
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(memory)
+
+    if long_memory:
+        messages.append({
+            "role": "system",
+            "content": "Long-term memory about the user:\n" + "\n".join(long_memory)
+        })
+
+    messages.extend(short_memory)
     messages.append({"role": "user", "content": prompt})
 
     response = requests.post(
@@ -71,6 +95,29 @@ def ollama_chat(prompt: str, system_prompt: str, memory: list) -> str:
         json={
             "model": "qwen2.5:1.5b",
             "messages": messages,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["message"]["content"]
+
+def summarize_memory(conversation):
+    summary_prompt = (
+        "Summarize the following conversation into concise long-term facts "
+        "about the user. Keep it factual.\n\n"
+    )
+    for msg in conversation:
+        summary_prompt += f"{msg['role']}: {msg['content']}\n"
+
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={
+            "model": "qwen2.5:1.5b",
+            "messages": [
+                {"role": "system", "content": "You summarize conversations."},
+                {"role": "user", "content": summary_prompt},
+            ],
             "stream": False,
         },
         timeout=120,
@@ -102,7 +149,7 @@ async def on_message(message):
 
     # AI command
     if message.content.startswith("!ai "):
-        user_id = message.author.id
+        user_id = str(message.author.id)
         prompt = message.content[4:]
 
         await message.channel.typing()
@@ -112,20 +159,34 @@ async def on_message(message):
                 ollama_chat,
                 prompt,
                 system_prompt,
-                list(user_memory[user_id])
+                list(user_memory[user_id]),
+                long_term_memory.get(user_id, [])
             )
         except Exception as e:
             print(e)
             await message.channel.send("AI error.")
             return
 
-        # save memory
+        # store short-term memory
         user_memory[user_id].append(
             {"role": "user", "content": prompt}
         )
         user_memory[user_id].append(
             {"role": "assistant", "content": reply}
         )
+
+        # summarize into long-term memory when short-term fills
+        if len(user_memory[user_id]) >= SHORT_TERM_LIMIT:
+            try:
+                summary = await asyncio.to_thread(
+                    summarize_memory,
+                    list(user_memory[user_id])
+                )
+                long_term_memory.setdefault(user_id, []).append(summary)
+                save_long_term_memory(long_term_memory)
+                user_memory[user_id].clear()
+            except Exception as e:
+                print("Summary failed:", e)
 
         for chunk in (
             reply[i:i + 2000]
@@ -138,8 +199,22 @@ async def on_message(message):
 # commands
 @bot.command()
 async def clear_memory(ctx):
-    user_memory.pop(ctx.author.id, None)
-    await ctx.send("Your AI memory has been cleared.")
+    user_memory.pop(str(ctx.author.id), None)
+    await ctx.send("Your short-term memory has been cleared.")
+
+@bot.command()
+async def clear_long_memory(ctx):
+    long_term_memory.pop(str(ctx.author.id), None)
+    save_long_term_memory(long_term_memory)
+    await ctx.send("Your long-term memory has been cleared.")
+
+@bot.command()
+async def memory(ctx):
+    mem = long_term_memory.get(str(ctx.author.id))
+    if not mem:
+        await ctx.send("No long-term memory stored.")
+    else:
+        await ctx.send("\n".join(mem[-5:]))
 
 @bot.command()
 async def hello(ctx):
@@ -150,9 +225,7 @@ async def assign(ctx):
     role = discord.utils.get(ctx.guild.roles, name=secret_role)
     if role:
         await ctx.author.add_roles(role)
-        await ctx.send(
-            f"{ctx.author.mention} is now assigned to {secret_role}"
-        )
+        await ctx.send(f"{ctx.author.mention} is now assigned to {secret_role}")
     else:
         await ctx.send("Role doesn't exist")
 
@@ -161,9 +234,7 @@ async def remove(ctx):
     role = discord.utils.get(ctx.guild.roles, name=secret_role)
     if role:
         await ctx.author.remove_roles(role)
-        await ctx.send(
-            f"{ctx.author.mention} has had the {secret_role} removed"
-        )
+        await ctx.send(f"{ctx.author.mention} has had the {secret_role} removed")
     else:
         await ctx.send("Role doesn't exist")
 
@@ -177,10 +248,7 @@ async def reply(ctx):
 
 @bot.command()
 async def poll(ctx, *, question):
-    embed = discord.Embed(
-        title="New Poll",
-        description=question
-    )
+    embed = discord.Embed(title="New Poll", description=question)
     poll_message = await ctx.send(embed=embed)
     await poll_message.add_reaction("😊")
     await poll_message.add_reaction("😒")
